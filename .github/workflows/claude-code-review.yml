@@ -42,8 +42,11 @@ on:
   #
   # The command must be the FIRST characters of the comment, followed by
   # whitespace or end-of-comment: `/review` or `/review please`. A leading
-  # space or newline, or `Looks good, /review`, matches nothing and produces
-  # no run at all. This is narrower than the deleted workflow, which matched
+  # space or newline, or `Looks good, /review`, matches nothing, so every job
+  # skips and the run is recorded as skipped with nothing posted. (A run is
+  # still created -- this repo's history holds 23 such skipped runs for the
+  # workflow being deleted here.) This is narrower than the deleted workflow,
+  # which matched
   # `@claude review` anywhere in the body.
   #
   # It is a slash command rather than a mention on purpose: any `@claude`
@@ -77,9 +80,12 @@ jobs:
       (vars.CLAUDE_AGENT_DISABLED == 'true' &&
       contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
-    # `pull-requests: read` is required for the `gh api repos/../pulls/N` call
-    # below: declaring any scope in this block sets every unlisted scope to
-    # no-access, so it is not covered by the repo's default token.
+    # `pull-requests: read` is declared so the `gh api repos/../pulls/N` call
+    # below does not depend on this repo happening to be public. Declaring any
+    # scope in this block sets every unlisted scope to no-access, so it is not
+    # covered by the default token; on a public repo the read would generally
+    # succeed anyway, which is exactly why the omission would go unnoticed
+    # until the repo went private.
     permissions:
       actions: write         # dispatch this workflow
       issues: write          # acknowledge the /review comment
@@ -140,28 +146,66 @@ jobs:
 
           # Stop here for a fork PR, and say so, rather than dispatching a run
           # that cannot review it. The reusable workflow's dispatch guard
-          # (gha#235) blocks fork PRs, and its claude-review job then skips --
-          # so dispatching would post ":mag: dispatched a review" and deliver
-          # nothing, with no red check to contradict the promise. The deleted
-          # claude-review-comment.yml aimed at this case via a
-          # refs/pull/<n>/head checkout; it never executed once (5/5 runs
-          # skipped), and #90 tracks the underlying gap.
+          # (gha#235) declines fork PRs, and its claude-review job then skips
+          # -- so dispatching would post ":mag: dispatched a review" and
+          # deliver nothing, with no red check to contradict the promise.
+          #
+          # Note the guard's reason is NOT the OIDC restriction that stops
+          # fork reviews on the `pull_request` path. A dispatched run executes
+          # in base-repo context with base-repo secrets, so no fork token is
+          # involved; upstream describes the guard as failing a mistaken
+          # dispatch fast rather than closing a hole. #90 tracks the real
+          # fork-review gap.
+          #
+          # The deleted claude-review-comment.yml aimed at this case with a
+          # refs/pull/<n>/head checkout. Of its 25 recorded runs, 23 skipped
+          # at the job `if:` and exactly one executed to completion -- run
+          # 30687108541, on 2026-08-01, against this very fork PR (#77). It
+          # posted nothing, because its prompt never carried `--comment`
+          # (#96); #97 fixed that for the other review workflow and never for
+          # this one. So the path was exercised once and was non-functional,
+          # rather than never exercised.
           if [ "$PR_HEAD_REPO" != "$REPO" ]; then
-            echo "::warning::PR #$PR_NUMBER is from a fork ($PR_HEAD_REPO); the reusable review workflow blocks fork reviews, so no review was dispatched."
+            echo "::warning::PR #$PR_NUMBER is from a fork ($PR_HEAD_REPO); the reusable review workflow declines fork reviews, so no review was dispatched."
             gh issue comment "$PR_NUMBER" --repo "$REPO" \
-              --body ":no_entry: \`$TRIGGER\` received, but this PR is from a fork (\`$PR_HEAD_REPO\`), and fork PRs cannot be reviewed by this workflow -- a fork's token cannot complete the OIDC exchange, so the reusable workflow's dispatch guard blocks them. Tracked in #90." \
+              --body ":no_entry: \`$TRIGGER\` received, but this PR is from a fork (\`$PR_HEAD_REPO\`), and the reusable review workflow's dispatch guard declines fork PRs. Tracked in #90." \
               || echo "::warning::Could not post the fork notice."
             exit 0
           fi
 
+          # A `workflow_dispatch` runs the workflow file AS IT EXISTS AT THE
+          # DISPATCHED REF, so `--ref "$PR_BRANCH"` needs that branch to exist
+          # AND its copy of this file to already carry the workflow_dispatch
+          # trigger. Neither is guaranteed: this PR is what ADDS the trigger,
+          # so every branch cut before it lacks it, and a closed PR's head
+          # branch may have been deleted outright.
+          #
+          # So try the PR branch first (it pins the review's check-runs to the
+          # right commit), fall back to a no-ref dispatch against the default
+          # branch (upstream's documented lesser problem -- the check-run
+          # mis-attributes), and only acknowledge if one of them actually
+          # started a run. Acknowledging unconditionally is what turns a
+          # failed dispatch into a promise nothing keeps.
           echo "Dispatching $WF_FILE to review PR #$PR_NUMBER ($PR_BRANCH) ($TRIGGER comment)."
-          # --ref pins the dispatched run's check-runs to the PR's branch.
-          # Without it, workflow_dispatch falls back to the default branch and
-          # the review check-run can land on the wrong commit.
-          gh workflow run "$WF_FILE" --repo "$REPO" --ref "$PR_BRANCH" -f pr_number="$PR_NUMBER"
-          gh issue comment "$PR_NUMBER" --repo "$REPO" \
-            --body ":mag: \`$TRIGGER\` received -- dispatched a Claude review of this PR (see the [dispatch run]($RUN_URL)). The review posts as its own comment when it finishes." \
-            || echo "::warning::Could not acknowledge the $TRIGGER comment."
+          DISPATCHED=false
+          if gh workflow run "$WF_FILE" --repo "$REPO" --ref "$PR_BRANCH" -f pr_number="$PR_NUMBER"; then
+            DISPATCHED=true
+          elif gh workflow run "$WF_FILE" --repo "$REPO" -f pr_number="$PR_NUMBER"; then
+            DISPATCHED=true
+            echo "::notice::Dispatch against '$PR_BRANCH' failed; dispatched against the default branch instead. The review check-run will attribute to the default branch."
+          fi
+
+          if [ "$DISPATCHED" = 'true' ]; then
+            gh issue comment "$PR_NUMBER" --repo "$REPO" \
+              --body ":mag: \`$TRIGGER\` received -- dispatched a Claude review of this PR (see the [dispatch run]($RUN_URL)). The review posts as its own comment when it finishes." \
+              || echo "::warning::Could not acknowledge the $TRIGGER comment."
+          else
+            echo "::error::Could not dispatch $WF_FILE for PR #$PR_NUMBER against either '$PR_BRANCH' or the default branch."
+            gh issue comment "$PR_NUMBER" --repo "$REPO" \
+              --body ":warning: \`$TRIGGER\` received, but the review could not be dispatched. \`$WF_FILE\` needs a \`workflow_dispatch\` trigger on both this PR's branch and the default branch, and at least one of them does not have it yet (see the [dispatch run]($RUN_URL))." \
+              || echo "::warning::Could not report the failed dispatch."
+            exit 1
+          fi
 
   review:
     # pull_request and workflow_dispatch only; the issue_comment path is
@@ -170,11 +214,17 @@ jobs:
     if: github.event_name != 'issue_comment'
     permissions:
       contents: read
-      # Kept at `write` deliberately. It is safe under `pull_request` (not
-      # `pull_request_target`): GitHub forces a read-only GITHUB_TOKEN for
-      # fork PRs regardless of what this block declares. Without it, same-repo
-      # PRs -- the common case here -- get a job that succeeds and posts
-      # nothing (#91). Do not narrow this to `read`.
+      # Kept at `write` deliberately. Without it, same-repo PRs -- the common
+      # case here -- get a job that succeeds and posts nothing (#91). Do not
+      # narrow this to `read`.
+      #
+      # Two triggers reach this job, and they are safe for different reasons.
+      # Under `pull_request` (not `pull_request_target`), GitHub forces a
+      # read-only GITHUB_TOKEN for fork PRs regardless of what this block
+      # declares. Under `workflow_dispatch` the token is NOT forced read-only
+      # and the PR number is caller-supplied, so what bounds that path is
+      # upstream's fork/Dependabot dispatch guard (gha#235) plus the
+      # OWNER/MEMBER/COLLABORATOR gate on the job that dispatches.
       pull-requests: write
       issues: write
       id-token: write
@@ -187,24 +237,28 @@ jobs:
       # Wires the workflow_dispatch input through so a dispatched review knows
       # which PR to read; empty (and ignored) on pull_request runs.
       pr-number: ${{ inputs.pr_number }}
-      # Upstream defaults this repo is accepting deliberately. Named here
-      # rather than set, so this `with:` block carries only deviations --
-      # but named rather than left silent, because each is new behaviour
-      # relative to the hand-rolled workflow:
-      #   report-cost: true     posts the run's dollar cost; the old one posted none
+      # INPUT DEFAULTS accepted deliberately. Named here rather than set, so
+      # this `with:` block carries only deviations -- but named rather than
+      # left silent, because each is new behaviour relative to the
+      # hand-rolled workflow:
+      #   report-cost: true     appends the run's dollar cost to whichever
+      #                         comment the workflow already posts (its own
+      #                         comment only on the commit-and-dispatch path);
+      #                         the old workflow reported no cost at all
       #   use-ai-config: true   installs the Morrison-Lab/ai-config plugin into the reviewer
       #   lab-manual: true      R/tidyverse SERG lab manual; this is an R + Quarto repo
       #   track-progress: false agent mode, so summary-only reviews and no git write tools
       #
-      # Also inherited: the reusable workflow adds a `require-review` job. It
+      # A JOB, not an input: the reusable workflow adds `require-review`. It
       # is not in this repo's branch ruleset (which requires build-deploy,
       # lint-project and Spellcheck), so it cannot block a merge. Note it can
       # report red when a review run is CANCELLED rather than failed, which
       # happens when a push and a dispatched review race.
       #
-      # Set this to true if a review ever completes without posting again
-      # (#105): it un-hides claude-code-action's SDK output, which otherwise
-      # prints "full output hidden for security" and makes an auth/usage
-      # rejection or a denied tool call unreadable from the check alone.
-      # Upstream already defaults it to false, so it is left unset here.
+      # A COMMENTED-OUT INPUT, below: set `show-full-output: true` if a review
+      # again completes without posting (#105). It un-hides
+      # claude-code-action's SDK output, which otherwise prints "full output
+      # hidden for security" and makes an auth/usage rejection or a denied
+      # tool call unreadable from the check alone. Upstream defaults it to
+      # false, so leaving it unset changes nothing today.
       # show-full-output: true
