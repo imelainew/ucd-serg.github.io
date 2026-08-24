@@ -1,68 +1,143 @@
+# Caller stub for Morrison-Lab/gha's reusable claude-code-review.yml.
+#
+# Replaces this repo's two hand-rolled review workflows (the former
+# claude-code-review.yml, which called anthropics/claude-code-action directly,
+# and claude-review-comment.yml, deleted alongside this change). See #101.
+#
+# NOTE: Do NOT declare a top-level `concurrency:` block here. The reusable
+# workflow manages per-PR concurrency internally on its own job
+# (`group: claude-review-<PR>`); a PR-scoped group in the caller deadlocks
+# GitHub Actions against the nested job and cancels the run (gha#437).
+#
+# Secrets are passed explicitly rather than with `secrets: inherit`: GitHub
+# only inherits secrets into a reusable workflow owned by the same org/user,
+# and this is a UCD-SERG repo calling a Morrison-Lab workflow, so `inherit`
+# would hand it an empty token.
 name: Claude Code Review
 
-# Do not switch this to `pull_request_target`.
-# Anthropic's token-exchange endpoint rejects OIDC tokens minted for that
-# event, so the job fails with "401 Unauthorized - Invalid OIDC token"
-# before Claude ever runs. See
-# https://github.com/anthropics/claude-code-action/issues/713
 on:
+  # Automatic review on PR activity. Same trigger list the hand-rolled
+  # workflow used, and deliberately still `pull_request` rather than
+  # `pull_request_target`: Anthropic's token-exchange endpoint rejects OIDC
+  # tokens minted for pull_request_target, so the job 401s before Claude runs
+  # (anthropics/claude-code-action#713, this repo's #83/#89/#90).
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+  # On-demand `/review` from a trusted collaborator. This is the replacement
+  # for claude-review-comment.yml's `@claude review` path. It is a slash
+  # command rather than a mention on purpose: any `@claude` substring also
+  # wakes claude.yml, which would dispatch a second paid review of the same PR.
+  issue_comment:
+    types: [created]
+  # Required so claude.yml can re-dispatch a review of the commits an @claude
+  # run pushes, and so the `/review` job below can re-enter this workflow.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull request number to review'
+        required: true
+        type: string
 
 jobs:
-  claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
+  # `/review` at the start of a PR comment (from an OWNER/MEMBER/COLLABORATOR)
+  # dispatches an on-demand review of that PR, independent of claude.yml.
+  # Re-enters the workflow_dispatch path below, so this file must be on the
+  # default branch before the dispatch resolves.
+  dispatch-on-comment:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      (startsWith(github.event.comment.body, '/review') ||
+      (vars.CLAUDE_AGENT_DISABLED == 'true' &&
+      contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
-    # pull-requests: write is safe here because this workflow uses the
-    # `pull_request` trigger (not `pull_request_target`): GitHub always
-    # forces a read-only GITHUB_TOKEN for PRs from forks regardless of what
-    # this block declares, so forked PRs stay read-only either way. Without
-    # write access here, same-repo PRs (the common case in this repo) never
-    # get their review posted even though the job itself succeeds.
+    permissions:
+      actions: write        # dispatch this workflow
+      issues: write         # acknowledge the /review comment
+    steps:
+      - name: Parse this workflow's ref
+        id: this-wf
+        uses: Morrison-Lab/gha/.github/actions/parse-workflow-ref@v2
+        with:
+          workflow-ref: ${{ github.workflow_ref }}
+
+      # Only active when the repository variable CLAUDE_AGENT_DISABLED is
+      # 'true'. It is unset here, so this step never runs and `@claude review`
+      # keeps routing through claude.yml alone -- no double dispatch.
+      - name: Check for an `@claude review` request
+        id: mention
+        if: ${{ vars.CLAUDE_AGENT_DISABLED == 'true' }}
+        uses: Morrison-Lab/gha/.github/actions/detect-review-request@v2
+        with:
+          comment-body: ${{ github.event.comment.body }}
+
+      - name: Dispatch a review for the commented PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          WF_PATH: ${{ steps.this-wf.outputs.path }}
+          # Passed via env (not inlined) so the comment body is a shell value,
+          # never interpreted as script -- avoids injection.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          # Empty when the step above was skipped, i.e. when the fallback is off.
+          MENTION_MATCH: ${{ steps.mention.outputs.match }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The job-level `if:` only does cheap pre-filters; GitHub Actions
+          # expressions can't reliably tell '/review' from '/reviewer' or
+          # handle a newline/tab after the command. Enforce the real match here.
+          if [[ "$COMMENT_BODY" =~ ^/review([[:space:]]|$) ]]; then
+            TRIGGER='/review'
+          elif [ "$MENTION_MATCH" = 'true' ]; then
+            TRIGGER='@claude review'
+          else
+            echo "Comment is neither a standalone '/review' command nor an '@claude review' request; skipping dispatch."
+            exit 0
+          fi
+          WF_FILE=$(basename "$WF_PATH")
+          # This job never checks out the repo, so the PR's head branch has to
+          # be looked up explicitly. --ref pins the dispatched run's check-runs
+          # to that branch instead of the default branch.
+          PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          PR_BRANCH=$(jq -r '.head.ref' <<< "$PR_JSON")
+          PR_HEAD_REPO=$(jq -r '.head.repo.full_name' <<< "$PR_JSON")
+          echo "Dispatching $WF_FILE to review PR #$PR_NUMBER ($PR_BRANCH) ($TRIGGER comment)."
+          # A fork PR's head branch only exists in the fork, so --ref would
+          # fail to resolve there.
+          REF_ARGS=(--ref "$PR_BRANCH")
+          if [ "$PR_HEAD_REPO" != "$REPO" ]; then
+            echo "::notice::PR #$PR_NUMBER is from a fork ($PR_HEAD_REPO); dispatching $WF_FILE without --ref."
+            REF_ARGS=()
+          fi
+          gh workflow run "$WF_FILE" --repo "$REPO" "${REF_ARGS[@]}" -f pr_number="$PR_NUMBER"
+          gh issue comment "$PR_NUMBER" --repo "$REPO" \
+            --body ":mag: \`$TRIGGER\` received -- dispatched a Claude review of this PR (see the [dispatch run]($RUN_URL)). The review posts as its own comment when it finishes." \
+            || echo "::warning::Could not acknowledge the $TRIGGER comment."
+
+  review:
+    # pull_request and workflow_dispatch only; the issue_comment path is
+    # handled by dispatch-on-comment above (which re-enters via
+    # workflow_dispatch).
+    if: github.event_name != 'issue_comment'
     permissions:
       contents: read
       pull-requests: write
-      issues: read
+      issues: write
       id-token: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Run Claude Code Review
-        id: claude-review
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          # `--comment` is load-bearing, not decoration. The code-review
-          # plugin's step 7 reads: "If `--comment` argument was NOT provided,
-          # stop here. Do not post any GitHub comments." Without it the review
-          # runs, finds whatever it finds, prints to the job log, and posts
-          # nothing - with a green check. See issue #96.
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
-          # This must match the code-review plugin's own `allowed-tools`
-          # frontmatter (plugins/code-review/commands/code-review.md in
-          # anthropics/claude-code) exactly. claude_args replaces the
-          # effective allowlist rather than adding to it, so a narrower list
-          # here (as a previous version of this file had) denies the
-          # plugin's own steps - e.g. `gh pr diff`/`gh pr view` calls it
-          # makes to gather context - not just the final posting step.
-          claude_args: '--allowed-tools "Bash(gh issue view:*)" "Bash(gh search:*)" "Bash(gh issue list:*)" "Bash(gh pr comment:*)" "Bash(gh pr diff:*)" "Bash(gh pr view:*)" "Bash(gh pr list:*)" "mcp__github_inline_comment__create_inline_comment"'
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-
+      actions: read   # lets the reviewer read CI status (github_ci MCP server)
+    uses: Morrison-Lab/gha/.github/workflows/claude-code-review.yml@v2
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # unset here; empty when using OAuth
+    with:
+      # Wires the workflow_dispatch input through so claude.yml can re-dispatch
+      # a review on Claude's commits; empty (and ignored) on pull_request runs.
+      pr-number: ${{ inputs.pr_number }}
+      # Set to true if a review ever completes without posting again (#105):
+      # it un-hides claude-code-action's SDK output, which otherwise prints
+      # "full output hidden for security" and makes an auth/usage rejection or
+      # a denied tool call unreadable from the failing check alone.
+      show-full-output: false
