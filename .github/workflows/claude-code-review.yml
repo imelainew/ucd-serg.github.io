@@ -6,31 +6,56 @@
 #
 # NOTE: Do NOT declare a top-level `concurrency:` block here. The reusable
 # workflow manages per-PR concurrency internally on its own job
-# (`group: claude-review-<PR>`); a PR-scoped group in the caller deadlocks
-# GitHub Actions against the nested job and cancels the run (gha#437).
+# (`group: claude-review-<PR>`); a caller-level group with the same name as
+# that nested group deadlocks GitHub Actions and cancels the run (gha#437).
+# gha#437 tested the identical-name case specifically; a differently-named
+# PR-scoped group is untested, so the safe rule is to declare none.
 #
 # Secrets are passed explicitly rather than with `secrets: inherit`: GitHub
-# only inherits secrets into a reusable workflow owned by the same org/user,
-# and this is a UCD-SERG repo calling a Morrison-Lab workflow, so `inherit`
-# would hand it an empty token.
+# only inherits secrets into a reusable workflow owned by the same
+# organization or enterprise, and this is a UCD-SERG repo calling a
+# Morrison-Lab workflow, so `inherit` would hand it an empty token.
 name: Claude Code Review
 
 on:
-  # Automatic review on PR activity. Same trigger list the hand-rolled
+  # Automatic review on PR activity. Same `types:` list the hand-rolled
   # workflow used, and deliberately still `pull_request` rather than
   # `pull_request_target`: Anthropic's token-exchange endpoint rejects OIDC
   # tokens minted for pull_request_target, so the job 401s before Claude runs
   # (anthropics/claude-code-action#713, this repo's #83/#89/#90).
+  #
+  # The trigger list is unchanged; the BEHAVIOUR is not. The hand-rolled
+  # workflow had no job-level `if:` at all, so it attempted a review on every
+  # matching event. The reusable workflow adds three skip gates, and each one
+  # silently stops reviewing a case this repo used to attempt:
+  #   * draft PRs                     (`pull_request.draft == false`)
+  #   * fork PRs                      (`head.repo.full_name == github.repository`)
+  #   * bot-sender events             (`sender.type != 'Bot'`)
+  # The third one changes #84 (Copilot-authored PRs 401 on token exchange)
+  # from a red failure into a gray skip. That is an improvement in signal, not
+  # a fix -- #84 stays open.
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-  # On-demand `/review` from a trusted collaborator. This is the replacement
-  # for claude-review-comment.yml's `@claude review` path. It is a slash
-  # command rather than a mention on purpose: any `@claude` substring also
-  # wakes claude.yml, which would dispatch a second paid review of the same PR.
+  # On-demand `/review` from a trusted collaborator, replacing
+  # claude-review-comment.yml's `@claude review` path for SAME-REPO PRs only
+  # (see the fork notice in the dispatch step below).
+  #
+  # The command must be the FIRST characters of the comment, followed by
+  # whitespace or end-of-comment: `/review` or `/review please`. A leading
+  # space or newline, or `Looks good, /review`, matches nothing and produces
+  # no run at all. This is narrower than the deleted workflow, which matched
+  # `@claude review` anywhere in the body.
+  #
+  # It is a slash command rather than a mention on purpose: any `@claude`
+  # substring also wakes claude.yml's agent on the same comment, so a mention
+  # would spend a second paid agent run alongside this one.
   issue_comment:
     types: [created]
-  # Required so claude.yml can re-dispatch a review of the commits an @claude
-  # run pushes, and so the `/review` job below can re-enter this workflow.
+  # Needed for two things. Today: so the `/review` job below can re-enter this
+  # workflow. Once #100 lands: so gha's claude.yml can re-dispatch a review of
+  # the commits an @claude run pushes. This repo's current bespoke claude.yml
+  # cannot dispatch anything (it holds `actions: read`, not `actions: write`,
+  # and has no dispatch step), so that second use is inert until #100 merges.
   workflow_dispatch:
     inputs:
       pr_number:
@@ -52,9 +77,13 @@ jobs:
       (vars.CLAUDE_AGENT_DISABLED == 'true' &&
       contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
+    # `pull-requests: read` is required for the `gh api repos/../pulls/N` call
+    # below: declaring any scope in this block sets every unlisted scope to
+    # no-access, so it is not covered by the repo's default token.
     permissions:
-      actions: write        # dispatch this workflow
-      issues: write         # acknowledge the /review comment
+      actions: write         # dispatch this workflow
+      issues: write          # acknowledge the /review comment
+      pull-requests: read    # read the PR's head branch and head repo
     steps:
       - name: Parse this workflow's ref
         id: this-wf
@@ -63,8 +92,11 @@ jobs:
           workflow-ref: ${{ github.workflow_ref }}
 
       # Only active when the repository variable CLAUDE_AGENT_DISABLED is
-      # 'true'. It is unset here, so this step never runs and `@claude review`
-      # keeps routing through claude.yml alone -- no double dispatch.
+      # 'true'. It is unset here, so this step never runs.
+      #
+      # With it unset, `@claude review` reaches claude.yml's agent and NOT
+      # this workflow, so it does not produce a plugin review. Until #100
+      # lands, `/review` is the only comment phrasing that produces a review.
       - name: Check for an `@claude review` request
         id: mention
         if: ${{ vars.CLAUDE_AGENT_DISABLED == 'true' }}
@@ -88,7 +120,9 @@ jobs:
           set -euo pipefail
           # The job-level `if:` only does cheap pre-filters; GitHub Actions
           # expressions can't reliably tell '/review' from '/reviewer' or
-          # handle a newline/tab after the command. Enforce the real match here.
+          # handle a newline/tab after the command. Enforce the real match
+          # here. Note a '/reviewers ...' comment DOES start a run, which then
+          # exits 0 here with only a log line.
           if [[ "$COMMENT_BODY" =~ ^/review([[:space:]]|$) ]]; then
             TRIGGER='/review'
           elif [ "$MENTION_MATCH" = 'true' ]; then
@@ -99,20 +133,32 @@ jobs:
           fi
           WF_FILE=$(basename "$WF_PATH")
           # This job never checks out the repo, so the PR's head branch has to
-          # be looked up explicitly. --ref pins the dispatched run's check-runs
-          # to that branch instead of the default branch.
+          # be looked up explicitly.
           PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
           PR_BRANCH=$(jq -r '.head.ref' <<< "$PR_JSON")
           PR_HEAD_REPO=$(jq -r '.head.repo.full_name' <<< "$PR_JSON")
-          echo "Dispatching $WF_FILE to review PR #$PR_NUMBER ($PR_BRANCH) ($TRIGGER comment)."
-          # A fork PR's head branch only exists in the fork, so --ref would
-          # fail to resolve there.
-          REF_ARGS=(--ref "$PR_BRANCH")
+
+          # Stop here for a fork PR, and say so, rather than dispatching a run
+          # that cannot review it. The reusable workflow's dispatch guard
+          # (gha#235) blocks fork PRs, and its claude-review job then skips --
+          # so dispatching would post ":mag: dispatched a review" and deliver
+          # nothing, with no red check to contradict the promise. The deleted
+          # claude-review-comment.yml aimed at this case via a
+          # refs/pull/<n>/head checkout; it never executed once (5/5 runs
+          # skipped), and #90 tracks the underlying gap.
           if [ "$PR_HEAD_REPO" != "$REPO" ]; then
-            echo "::notice::PR #$PR_NUMBER is from a fork ($PR_HEAD_REPO); dispatching $WF_FILE without --ref."
-            REF_ARGS=()
+            echo "::warning::PR #$PR_NUMBER is from a fork ($PR_HEAD_REPO); the reusable review workflow blocks fork reviews, so no review was dispatched."
+            gh issue comment "$PR_NUMBER" --repo "$REPO" \
+              --body ":no_entry: \`$TRIGGER\` received, but this PR is from a fork (\`$PR_HEAD_REPO\`), and fork PRs cannot be reviewed by this workflow -- a fork's token cannot complete the OIDC exchange, so the reusable workflow's dispatch guard blocks them. Tracked in #90." \
+              || echo "::warning::Could not post the fork notice."
+            exit 0
           fi
-          gh workflow run "$WF_FILE" --repo "$REPO" "${REF_ARGS[@]}" -f pr_number="$PR_NUMBER"
+
+          echo "Dispatching $WF_FILE to review PR #$PR_NUMBER ($PR_BRANCH) ($TRIGGER comment)."
+          # --ref pins the dispatched run's check-runs to the PR's branch.
+          # Without it, workflow_dispatch falls back to the default branch and
+          # the review check-run can land on the wrong commit.
+          gh workflow run "$WF_FILE" --repo "$REPO" --ref "$PR_BRANCH" -f pr_number="$PR_NUMBER"
           gh issue comment "$PR_NUMBER" --repo "$REPO" \
             --body ":mag: \`$TRIGGER\` received -- dispatched a Claude review of this PR (see the [dispatch run]($RUN_URL)). The review posts as its own comment when it finishes." \
             || echo "::warning::Could not acknowledge the $TRIGGER comment."
@@ -124,6 +170,11 @@ jobs:
     if: github.event_name != 'issue_comment'
     permissions:
       contents: read
+      # Kept at `write` deliberately. It is safe under `pull_request` (not
+      # `pull_request_target`): GitHub forces a read-only GITHUB_TOKEN for
+      # fork PRs regardless of what this block declares. Without it, same-repo
+      # PRs -- the common case here -- get a job that succeeds and posts
+      # nothing (#91). Do not narrow this to `read`.
       pull-requests: write
       issues: write
       id-token: write
@@ -133,11 +184,24 @@ jobs:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # unset here; empty when using OAuth
     with:
-      # Wires the workflow_dispatch input through so claude.yml can re-dispatch
-      # a review on Claude's commits; empty (and ignored) on pull_request runs.
+      # Wires the workflow_dispatch input through so a dispatched review knows
+      # which PR to read; empty (and ignored) on pull_request runs.
       pr-number: ${{ inputs.pr_number }}
-      # Set to true if a review ever completes without posting again (#105):
-      # it un-hides claude-code-action's SDK output, which otherwise prints
-      # "full output hidden for security" and makes an auth/usage rejection or
-      # a denied tool call unreadable from the failing check alone.
-      show-full-output: false
+      # Upstream defaults this repo is accepting deliberately, stated rather
+      # than inherited silently -- each is new behaviour relative to the
+      # hand-rolled workflow:
+      report-cost: true      # posts the run's dollar cost; the old workflow posted none
+      use-ai-config: true    # installs the Morrison-Lab/ai-config plugin into the reviewer
+      lab-manual: true       # R/tidyverse SERG lab manual; this is an R + Quarto repo
+      # Also inherited: the reusable workflow adds a `require-review` job. It
+      # is not in this repo's branch ruleset (which requires build-deploy,
+      # lint-project and Spellcheck), so it cannot block a merge. Note it can
+      # report red when a review run is CANCELLED rather than failed, which
+      # happens when a push and a dispatched review race.
+      #
+      # Set this to true if a review ever completes without posting again
+      # (#105): it un-hides claude-code-action's SDK output, which otherwise
+      # prints "full output hidden for security" and makes an auth/usage
+      # rejection or a denied tool call unreadable from the check alone.
+      # Upstream already defaults it to false, so it is left unset here.
+      # show-full-output: true
