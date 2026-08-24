@@ -71,18 +71,31 @@ jobs:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # unset here; empty when using OAuth
-      # Not set in this repo. Without it the integrated GITHUB_TOKEN cannot
-      # push changes under .github/workflows/ (GitHub rejects them without the
-      # `workflows` scope); the run reports the rejection and posts Claude's
-      # commits as a git format-patch so they survive. Worth adding, since
-      # much of this repo's recent @claude work has been workflow edits.
+      # LIVE as of 2026-08-24 16:35Z: a WORKFLOW_TOKEN secret exists at the
+      # UCD-SERG org level with visibility "all repositories", so this
+      # forwarding is active rather than aspirational. Confirmed reachable
+      # from this repo, and separately verified to authenticate as a user PAT
+      # that can push a commit touching .github/workflows/ -- i.e. it does
+      # carry the `workflows` scope.
       #
-      # Two consequences to weigh first. Cost: unlike GITHUB_TOKEN, a PAT push
-      # DOES trigger other push-based workflows, so adding it would fire
-      # publish.yml and check-spelling.yaml on Claude's pushes. Benefit: for
-      # the same reason it also makes a Claude push fire `synchronize`, which
-      # a GITHUB_TOKEN push does not -- so it would give Claude's commits an
-      # automatic review even without the dispatch path.
+      # Forwarding it explicitly is load-bearing, not decorative. A reusable
+      # workflow only ever sees the secrets its caller passes, so an org
+      # secret this block omitted would be invisible to gha's workflow no
+      # matter how broad its visibility.
+      #
+      # Without it the integrated GITHUB_TOKEN cannot push changes under
+      # .github/workflows/ (GitHub rejects them without the `workflows`
+      # scope); gha reports the rejection and posts Claude's commits as a
+      # git format-patch so they survive. That matters here specifically:
+      # #83, #87, #89, #91, #92, #93, #94, #95 and #97 all touched
+      # .github/workflows/.
+      #
+      # Two consequences, now live rather than hypothetical. Cost: unlike
+      # GITHUB_TOKEN, a PAT push DOES trigger other push-based workflows, so
+      # Claude's pushes now fire this repo's push/pull_request workflows.
+      # Benefit: for the same reason a Claude push fires `synchronize`, which
+      # a GITHUB_TOKEN push does not -- so Claude's commits get an automatic
+      # review even without the dispatch path.
       WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
       # SUBMODULES_TOKEN is deliberately omitted: this repo has no submodules.
     with:
