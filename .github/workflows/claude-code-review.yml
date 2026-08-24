@@ -187,12 +187,15 @@ jobs:
       # Wires the workflow_dispatch input through so a dispatched review knows
       # which PR to read; empty (and ignored) on pull_request runs.
       pr-number: ${{ inputs.pr_number }}
-      # Upstream defaults this repo is accepting deliberately, stated rather
-      # than inherited silently -- each is new behaviour relative to the
-      # hand-rolled workflow:
-      report-cost: true      # posts the run's dollar cost; the old workflow posted none
-      use-ai-config: true    # installs the Morrison-Lab/ai-config plugin into the reviewer
-      lab-manual: true       # R/tidyverse SERG lab manual; this is an R + Quarto repo
+      # Upstream defaults this repo is accepting deliberately. Named here
+      # rather than set, so this `with:` block carries only deviations --
+      # but named rather than left silent, because each is new behaviour
+      # relative to the hand-rolled workflow:
+      #   report-cost: true     posts the run's dollar cost; the old one posted none
+      #   use-ai-config: true   installs the Morrison-Lab/ai-config plugin into the reviewer
+      #   lab-manual: true      R/tidyverse SERG lab manual; this is an R + Quarto repo
+      #   track-progress: false agent mode, so summary-only reviews and no git write tools
+      #
       # Also inherited: the reusable workflow adds a `require-review` job. It
       # is not in this repo's branch ruleset (which requires build-deploy,
       # lint-project and Spellcheck), so it cannot block a merge. Note it can
