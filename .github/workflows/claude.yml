@@ -1,3 +1,14 @@
+# Caller stub for Morrison-Lab/gha's reusable claude.yml (agent mode).
+#
+# Replaces this repo's hand-rolled workflow, which called
+# anthropics/claude-code-action directly. See #100, and #99 for the two gaps
+# this closes (read-only `pull-requests` permission, and no author check on
+# who may trigger an @claude run).
+#
+# Secrets are passed explicitly rather than with `secrets: inherit`: GitHub
+# only inherits secrets into a reusable workflow owned by the same org/user,
+# and this is a UCD-SERG repo calling a Morrison-Lab workflow, so `inherit`
+# would hand it an empty token.
 name: Claude Code
 
 on:
@@ -12,39 +23,40 @@ on:
 
 jobs:
   claude:
+    # Cheap caller-side gate: only invoke the reusable workflow when an
+    # @claude mention is present AND the author is trusted
+    # (OWNER/MEMBER/COLLABORATOR). This mirrors the reusable workflow's own
+    # trusted-author gate as defense-in-depth: without it the run is still
+    # skipped downstream, but only after invoking a workflow that was granted
+    # elevated permissions and passed secrets. The hand-rolled workflow this
+    # replaces had no author check at all -- the second half of #99.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
-    runs-on: ubuntu-latest
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
     permissions:
-      contents: read
-      pull-requests: read
-      issues: read
+      contents: write        # push branches
+      pull-requests: write   # open/update PRs -- was `read`, the first half of #99
+      issues: write          # comment back on the thread
       id-token: write
-      actions: read # Required for Claude to read CI results on PRs
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Run Claude Code
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-
-          # This is an optional setting that allows Claude to read CI results on PRs
-          additional_permissions: |
-            actions: read
-
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
-
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
-
+      actions: write         # dispatch claude-code-review.yml on Claude's commits
+    uses: Morrison-Lab/gha/.github/workflows/claude.yml@v2
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # unset here; empty when using OAuth
+      # Not set in this repo. Without it the integrated GITHUB_TOKEN cannot
+      # push changes under .github/workflows/ (GitHub rejects them without the
+      # `workflows` scope); the run reports the rejection and posts Claude's
+      # commits as a git format-patch so they survive. Worth adding, since
+      # much of this repo's recent @claude work has been workflow edits.
+      WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+    with:
+      # This is a Quarto site, so give Claude the toolchain to render and
+      # check its own .qmd edits. The hand-rolled workflow installed neither
+      # Quarto nor R.
+      install-quarto: true
+      # The repo carries an R package skeleton (DESCRIPTION, R/, tests/), so
+      # install its R dependencies. This is gha's default; stated explicitly
+      # because it materially changes job setup time.
+      setup-r: true
